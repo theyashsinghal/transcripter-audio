@@ -590,7 +590,7 @@ if start_button:
             # Do not call st.experimental_rerun() — instead rely on session_state to render final UI below.
             # Optionally give the user a direct button to jump to results
             st.info("Processing finished. Scroll down to the Transcript Browser, or click the button below.")
-            if st.button("Show Results Now"):
+            if st.button("Show Results Now", key="show_results_btn"):
                 # no-op: pressing this will cause the app to re-run the script and show Part 4
                 pass
     
