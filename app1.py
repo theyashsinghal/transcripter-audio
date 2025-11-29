@@ -1,5 +1,5 @@
-# app.py — COMPLETE BATCH TRANSCRIBER (MULTI-FILE SUPPORT)
-# Core imports, config, network helpers, MIME detection, one-shot upload, polling, transcription API.
+# app.py — COMPLETE BATCH TRANSCRIBER
+# Features: Multi-file support, Unique Mobile Logic, Latest Audio Priority, Outcome Fallback.
 
 import streamlit as st
 import pandas as pd
@@ -21,11 +21,9 @@ from typing import Optional, Dict, Any
 # --- CONFIG ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-# NOTE: "gemini-2.5-flash" is not a standard public endpoint yet. 
-# Using "gemini-2.5-flash" to ensure stability. Change back if you have specific access.
 MODEL_NAME = "gemini-2.5-flash" 
 
-# streaming download chunk size (upload is streaming one-shot)
+# streaming download chunk size
 DOWNLOAD_CHUNK_SIZE = 8192
 
 # Configure logging
@@ -57,8 +55,8 @@ BASE_CSS = """
     border-radius: 6px;
     background: var(--transcript-bg, #fafafa);
     border: 1px solid var(--border-color, #eee);
-    font-family: monospace; /* Monospace helps alignment */
-    white-space: pre-wrap;  /* Preserves newlines */
+    font-family: monospace; 
+    white-space: pre-wrap;  
 }
 
 /* Speaker colors */
@@ -101,9 +99,6 @@ def _sleep_with_jitter(base_seconds: float, attempt: int):
     time.sleep(to_sleep)
 
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
-    """
-    Robust wrapper for requests with exponential backoff + jitter.
-    """
     last_exc = None
     for attempt in range(max_retries):
         try:
@@ -118,7 +113,6 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
             logger.warning("RequestException on %s %s: %s (attempt %d)", method, url, str(e), attempt + 1)
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
-    # all retries exhausted
     if last_exc:
         raise last_exc
     raise Exception("make_request_with_retry: retries exhausted without a response")
@@ -126,21 +120,11 @@ def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff
 # --- MIME & EXTENSION HANDLING ---
 
 COMMON_AUDIO_MIME = {
-    ".mp3": "audio/mpeg",
-    ".wav": "audio/wave",
-    ".m4a": "audio/mp4",
-    ".aac": "audio/aac",
-    ".ogg": "audio/ogg",
-    ".oga": "audio/ogg",
-    ".webm": "audio/webm",
-    ".flac": "audio/flac"
+    ".mp3": "audio/mpeg", ".wav": "audio/wave", ".m4a": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac"
 }
 
 def detect_extension_and_mime(url_path: str, header_content_type: Optional[str]) -> (str, str):
-    """
-    Determine extension and mime type from URL path and header.
-    Prioritize path extension, else header, else default.
-    """
     _, ext = os.path.splitext(url_path or "")
     ext = ext.lower()
     
@@ -151,27 +135,19 @@ def detect_extension_and_mime(url_path: str, header_content_type: Optional[str])
     # 2. Try header
     if header_content_type:
         ctype = header_content_type.split(";")[0].strip()
-        # Reverse lookup map
         for k, v in COMMON_AUDIO_MIME.items():
             if v == ctype:
                 return k, ctype
-        
-        # Attempt standard guess
         guessed_ext = mimetypes.guess_extension(ctype)
         if guessed_ext:
             return guessed_ext.lower(), ctype
             
     # 3. Last fallback: Default to MP3
-    # CRITICAL FIX: Google File API rejects unknown/bin types. 
-    # Forcing .mp3 usually works even if the container is slightly different.
     return ".mp3", "audio/mpeg"
 
-# --- UPLOAD PIPELINE (simple one-shot streaming upload) ---
+# --- UPLOAD PIPELINE ---
 
 def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: int) -> str:
-    """
-    Starts a resumable upload session. Returns the upload URL.
-    """
     url = f"{UPLOAD_URL}?uploadType=resumable&key={api_key}"
     headers = {
         "Content-Type": "application/json; charset=UTF-8",
@@ -183,7 +159,6 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
     payload = json.dumps({"file": {"display_name": display_name}})
     resp = make_request_with_retry("POST", url, headers=headers, data=payload)
     if resp.status_code not in (200, 201):
-        logger.error("initiate_upload failed: %s %s", resp.status_code, resp.text)
         raise Exception(f"Init failed ({resp.status_code}): {resp.text}")
     
     upload_url = resp.headers.get("X-Goog-Upload-URL")
@@ -192,9 +167,6 @@ def initiate_upload(api_key: str, display_name: str, mime_type: str, file_size: 
     return upload_url
 
 def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, Any]:
-    """
-    Streams file bytes and finalizes in one request.
-    """
     file_size = os.path.getsize(file_path)
     headers = {
         "Content-Type": mime_type or "application/octet-stream",
@@ -202,7 +174,6 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
         "X-Goog-Upload-Offset": "0",
         "X-Goog-Upload-Command": "upload, finalize"
     }
-
     # Try POST first (streaming)
     with open(file_path, "rb") as f:
         resp = requests.post(upload_url, headers=headers, data=f, timeout=300)
@@ -213,7 +184,6 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
             resp = requests.put(upload_url, headers=headers, data=f, timeout=300)
 
     if resp.status_code not in (200, 201):
-        logger.error("Upload failed: %s %s", resp.status_code, resp.text)
         raise Exception(f"UPLOAD FAILED {resp.status_code}: {resp.text}")
 
     try:
@@ -225,29 +195,20 @@ def upload_bytes(upload_url: str, file_path: str, mime_type: str) -> Dict[str, A
 # --- GOOGLE FILE STATUS POLLING ---
 
 def wait_for_active(api_key: str, file_name: str, timeout_seconds: int = 300) -> bool:
-    """
-    Poll until Google marks the file ACTIVE or FAILED.
-    """
     url = f"{BASE_URL}/v1beta/{file_name}?key={api_key}"
     start = time.time()
-    attempt = 0
     while True:
         resp = make_request_with_retry("GET", url)
         if resp.status_code != 200:
-            logger.warning("Status poll: got %s. Retrying...", resp.status_code)
-            attempt += 1
-            _sleep_with_jitter(1, attempt)
+            time.sleep(2)
         else:
             j = resp.json()
             state = j.get("state")
-            logger.debug("Polled file %s state=%s", file_name, state)
             if state == "ACTIVE":
                 return True
             if state == "FAILED":
                 raise Exception(f"File processing failed: {j.get('processingError', j)}")
-            
-            attempt += 1
-            time.sleep(2) # Simple sleep for polling
+            time.sleep(2)
 
         if time.time() - start > timeout_seconds:
             raise Exception("Timed out waiting for file to become ACTIVE.")
@@ -261,124 +222,138 @@ def delete_file(api_key: str, file_name: str):
 # --- TRANSCRIPTION CALLS ---
 
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
-    """
-    Calls Gemini generateContent for transcription.
-    """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
-
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
     ]
-
     payload = {
         "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
-            ]
+            "parts": [{"text": prompt}, {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}]
         }],
         "safetySettings": safety_settings,
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 8192
-        }
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
     }
-
     resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
     if resp.status_code != 200:
-        logger.error("Transcription API returned %s: %s", resp.status_code, resp.text)
         return f"API ERROR {resp.status_code}: {resp.text}"
 
     try:
         body = resp.json()
     except ValueError:
-        return "PARSE ERROR: Non-JSON response from transcription API."
+        return "PARSE ERROR: Non-JSON response."
 
     candidates = body.get("candidates") or []
     if not candidates:
-        prompt_feedback = body.get("promptFeedback", {})
-        if prompt_feedback and prompt_feedback.get("blockReason"):
-            return f"BLOCKED: {prompt_feedback.get('blockReason')}"
         return "NO TRANSCRIPT (Empty Response)"
     
-    first = candidates[0]
-    content = first.get("content", {})
-    parts = content.get("parts", [])
-    if not parts:
-        return "NO TRANSCRIPT (No parts in response)"
+    first_part = candidates[0].get("content", {}).get("parts", [])
+    if not first_part:
+        return "NO TRANSCRIPT (No parts)"
     
-    first_part = parts[0]
-    text = first_part.get("text") or first_part.get("content") or ""
-    return text
+    return first_part[0].get("text", "")
 
-# --- DIARIZATION-ENFORCEMENT PROMPT ---
 def build_prompt(language_label: str) -> str:
     return f"""
 Transcribe this call in {language_label} exactly as spoken.
 
-CRITICAL REQUIREMENTS — FOLLOW STRICTLY:
-1. EVERY line MUST start with exactly one of these labels:
-   - Speaker 1:
-   - Speaker 2:
-2. NEVER merge dialogue from two speakers in one line.
-3. If you are unsure who is speaking, GUESS — but DO NOT leave the speaker label blank.
-4. If the call sounds like a single-person monologue, STILL label every line as:
-   Speaker 1: <text>
-5. Do NOT summarize or improve the language. Write EXACTLY what was said.
-6. Maintain natural turn-taking and break lines whenever the speaker changes.
+CRITICAL REQUIREMENTS:
+1. EVERY line MUST start with 'Speaker 1:' or 'Speaker 2:'.
+2. NEVER merge dialogue from two speakers.
+3. If unsure, GUESS the speaker.
+4. If monologue, use 'Speaker 1:'.
+5. Write EXACTLY what was said.
 
 TIMESTAMP RULES:
-- Add timestamps at the start of EVERY line.
-- Format MUST be: [0ms-2500ms]
+- Format: [0ms-2500ms] at the start of EVERY line.
 - Use raw milliseconds only.
-- No mm:ss format allowed.
 
 LANGUAGE RULES:
-- ALL Hindi words must be written in Hinglish (Latin script).
-- NO Devanagari characters anywhere.
-- English words should remain English.
+- Hindi words must be in Hinglish (Latin script).
+- NO Devanagari.
 
-STRICT FORMAT (DO NOT IGNORE):
+STRICT FORMAT:
 - [timestamp] Speaker X: line of dialogue
-- Only one speaker per line.
-- Only one utterance per line.
-- If two people speak at the same time, split into two separate lines with separate timestamps.
-
-AUTO-CORRECTION:
-- If any line is missing the speaker label, FIX IT and assign Speaker 1 or Speaker 2 based on your best guess.
-- Do NOT output any unlabeled lines.
-
-Return ONLY the transcript. No explanation.
 """
+
+# --- NEW: DATA CONSOLIDATION LOGIC ---
+
+def consolidate_data_by_mobile(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Groups by mobile_number to ensure only ONE transcript per contact.
+    Prioritizes the LATEST date with a VALID recording_url.
+    If no URL exists for the contact, keeps the latest row and marks for Outcome Fallback.
+    """
+    # Ensure date is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        # Sort by mobile, then date descending (latest first)
+        df = df.sort_values(by=['mobile_number', 'date'], ascending=[True, False])
+    
+    unique_mobiles = df['mobile_number'].unique()
+    final_rows = []
+
+    for mobile in unique_mobiles:
+        # Get all rows for this specific mobile number
+        group = df[df['mobile_number'] == mobile]
+        
+        # Filter for rows that actually have a URL
+        valid_recording_rows = group[group['recording_url'].notna() & (group['recording_url'] != "")]
+        
+        if not valid_recording_rows.empty:
+            # Case A: We have at least one recording.
+            # Since we sorted by date DESC, the first one is the LATEST valid recording.
+            selected_row = valid_recording_rows.iloc[0].copy()
+            selected_row['processing_action'] = 'TRANSCRIBE'
+        else:
+            # Case B: No recording URL found in any attempt for this number.
+            # Pick the absolute latest attempt row.
+            selected_row = group.iloc[0].copy()
+            selected_row['processing_action'] = 'SKIP'
+            outcome_val = selected_row.get('outcome', 'N/A')
+            # Pre-fill transcript with outcome
+            selected_row['transcript'] = f"Outcome: {outcome_val}"
+            selected_row['status'] = '⚠️ Skipped (No Audio)'
+        
+        final_rows.append(selected_row)
+    
+    return pd.DataFrame(final_rows).reset_index(drop=True)
 
 # --- WORKER / PROCESSING FUNCTION ---
 
 def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template: str, keep_remote: bool = False) -> Dict[str, Any]:
     mobile = str(row.get("mobile_number", "Unknown"))
-    audio_url = row.get("recording_url")
+    
     result = {
         "index": index,
         "mobile_number": mobile,
-        "recording_url": audio_url,
-        "transcript": "",
-        "status": "Pending",
+        "recording_url": row.get("recording_url"),
+        "transcript": row.get("transcript", ""), # Use pre-filled if available
+        "status": row.get("status", "Pending"),
         "error": None,
     }
+
+    # CHECK ACTION FLAG
+    action = row.get("processing_action", "TRANSCRIBE")
+    
+    # If logic decided to skip (missing URL fallback), return immediately
+    if action == "SKIP":
+        return result
+
+    audio_url = row.get("recording_url")
+    if not audio_url or not isinstance(audio_url, str):
+        result.update({"status": "❌ Failed", "error": "Invalid URL"})
+        return result
 
     tmp_path = None
     file_info = None
 
-    if not audio_url or not isinstance(audio_url, str):
-        result.update({"status": "❌ Failed", "transcript": "", "error": "Missing or invalid recording_url"})
-        return result
-
     try:
         parsed = urlparse(audio_url)
 
-        # Download file to temp location (streamed)
+        # Download
         r = make_request_with_retry("GET", audio_url, stream=True)
         if r.status_code != 200:
             raise Exception(f"Failed to download audio URL ({r.status_code})")
@@ -388,30 +363,18 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                if chunk:
-                    tmp.write(chunk)
+                if chunk: tmp.write(chunk)
             tmp_path = tmp.name
 
-        file_size = os.path.getsize(tmp_path)
-
-        # Prepare unique remote name (sanitized)
         cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
         unique_name = f"rec_{cleaned_mobile}_{int(time.time())}{ext}"
 
-        # 1) Initiate
-        upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
-
-        # 2) Upload (one-shot streamed)
+        # Upload
+        upload_url = initiate_upload(api_key, unique_name, mime_type, os.path.getsize(tmp_path))
         file_info = upload_bytes(upload_url, tmp_path, mime_type)
-
-        # Validate file_info structure
-        if not file_info or not isinstance(file_info, dict) or not file_info.get("name") or not file_info.get("uri"):
-            raise Exception(f"Invalid file metadata returned: {file_info}")
-
-        # 3) Wait for ACTIVE
         wait_for_active(api_key, file_info["name"])
 
-        # 4) Generate transcript
+        # Transcribe
         transcript = generate_transcript(api_key, file_info["uri"], mime_type, prompt_template)
         result["transcript"] = transcript
         
@@ -427,122 +390,92 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
         result["error"] = str(e)
 
     finally:
-        # cleanup local
         if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception as e:
-                logger.warning("Failed to remove tmp file %s: %s", tmp_path, str(e))
-        # cleanup remote unless user asked to keep it
-        if file_info and isinstance(file_info, dict) and file_info.get("name") and not keep_remote:
-            try:
-                delete_file(api_key, file_info["name"])
-            except Exception:
-                pass
+            try: os.remove(tmp_path)
+            except: pass
+        if file_info and not keep_remote:
+            try: delete_file(api_key, file_info["name"])
+            except: pass
 
     return result
 
 # --- RESULT MERGE UTILITIES ---
 
-def merge_results_with_original(df_original: pd.DataFrame, processed_results: list) -> pd.DataFrame:
+def merge_results_with_original(df_consolidated: pd.DataFrame, processed_results: list) -> pd.DataFrame:
+    # We are merging back into the CONSOLIDATED dataframe, not the raw one
     results_df = pd.DataFrame(sorted(processed_results, key=lambda r: r["index"]))
-    orig_reset = df_original.reset_index() # column 'index' aligns with results_df.index values
     
-    existing_cols = set(results_df.columns)
-    extra_cols = [c for c in orig_reset.columns if c not in ("index",) and c not in existing_cols]
+    # We only need to update the transcript, status, error columns
+    cols_to_update = ["transcript", "status", "error"]
     
-    if extra_cols:
-        merged = results_df.merge(orig_reset[["index"] + extra_cols], on="index", how="left")
-    else:
-        merged = results_df
+    # Drop these from original if they exist to avoid collision
+    df_base = df_consolidated.drop(columns=[c for c in cols_to_update if c in df_consolidated.columns])
+    
+    # Merge using index (which was preserved in processing)
+    merged = df_base.merge(results_df[["index"] + cols_to_update], left_index=True, right_on="index", how="left")
     
     if "index" in merged.columns:
         merged = merged.drop(columns=["index"])
     return merged
 
-# --- HTML FORMATTING FOR VIEWER ---
+# --- HTML FORMATTING ---
 def colorize_transcript_html(text: str) -> str:
-    """Convert transcript text into HTML block with colored speaker lines and escaping."""
     if not isinstance(text, str) or not text.strip():
         return "<div class='other-speech'>No transcript</div>"
-
     lines = text.splitlines()
     html_output = ""
-    
     for line in lines:
         clean = line.strip()
         if not clean: continue
-        
         escaped_line = html.escape(clean)
         lc = clean.lower()
-        
-        if "speaker 1:" in lc:
-            html_output += f"<div class='speaker1'>{escaped_line}</div>"
-        elif "speaker 2:" in lc:
-            html_output += f"<div class='speaker2'>{escaped_line}</div>"
-        else:
-            html_output += f"<div class='other-speech'>{escaped_line}</div>"
-            
+        if "speaker 1:" in lc: html_output += f"<div class='speaker1'>{escaped_line}</div>"
+        elif "speaker 2:" in lc: html_output += f"<div class='speaker2'>{escaped_line}</div>"
+        else: html_output += f"<div class='other-speech'>{escaped_line}</div>"
     return f"<div>{html_output}</div>"
 
 # --- MAIN UI LOGIC ---
 
 def main():
-    # --- Initialize session state containers ---
-    if "processed_results" not in st.session_state:
-        st.session_state.processed_results = []
-
-    if "final_df" not in st.session_state:
-        st.session_state.final_df = pd.DataFrame()
-
-    if "orig_df" not in st.session_state:
-        st.session_state.orig_df = pd.DataFrame()
+    if "final_df" not in st.session_state: st.session_state.final_df = pd.DataFrame()
+    if "processed_results" not in st.session_state: st.session_state.processed_results = []
 
     # --- Sidebar ---
     with st.sidebar:
         st.header("Configuration")
         api_key = st.text_input("Gemini API Key", type="password")
-        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=8, value=4,
-                                help="Higher = faster but may hit API rate limits.")
-        keep_remote = st.checkbox("Keep audio on Google", value=False,
-                                help="For debugging: prevents auto-deletion of files from Gemini.")
+        max_workers = st.slider("Concurrency", 1, 8, 4)
+        keep_remote = st.checkbox("Keep remote files", value=False)
         st.divider()
-        
         language_mode = st.selectbox("Language", ["English (India)", "Hindi", "Mixed (Hinglish)"], index=2)
         lang_map = {
             "English (India)": "English (Indian accent)",
             "Hindi": "Hindi (Devanagari)",
             "Mixed (Hinglish)": "Mixed English and Hindi"
         }
-        
-        theme_choice = st.radio("Theme", options=["Light", "Dark"], index=0, horizontal=True)
-        st.caption("Use Dark theme if you prefer low-light UI.")
+        theme_choice = st.radio("Theme", ["Light", "Dark"], index=0, horizontal=True)
 
-    # Set theme container class
     theme_class = "dark-theme" if theme_choice == "Dark" else "light-theme"
     st.markdown(f"<div class='{theme_class}'>", unsafe_allow_html=True)
 
-    # --- CHANGED: accept_multiple_files=True ---
+    # --- UPDATED FILE UPLOADER ---
     uploaded_files = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"], accept_multiple_files=True)
 
-    # Placeholders for processing
     progress_bar = st.empty()
     status_text = st.empty()
     result_placeholder = st.empty()
 
     start_button = st.button("🚀 Start Batch Processing", type="primary")
 
-    # --- START PROCESSING ---
     if start_button:
-        # --- CHANGED: Logic to handle list of files ---
         if not api_key or not uploaded_files:
             st.error("Please enter API Key and upload one or more files.")
             st.stop()
 
+        # 1. READ & MERGE FILES
         all_dfs = []
         for file in uploaded_files:
             try:
-                # read each file and append
                 df_single = pd.read_excel(file)
                 all_dfs.append(df_single)
             except Exception as e:
@@ -550,32 +483,32 @@ def main():
                 continue
 
         if not all_dfs:
-            st.error("No valid Excel files found with data to process.")
+            st.error("No valid data found.")
             st.stop()
 
-        # Combine all files into one master DataFrame
-        # ignore_index=True is critical to regenerate a clean 0..N index
-        df = pd.concat(all_dfs, ignore_index=True)
+        raw_df = pd.concat(all_dfs, ignore_index=True)
 
-        if "recording_url" not in df.columns:
-            st.error("Column 'recording_url' is missing in the combined dataset.")
+        if "recording_url" not in raw_df.columns or "mobile_number" not in raw_df.columns:
+            st.error("Columns 'recording_url' and 'mobile_number' are required.")
             st.stop()
 
-        st.session_state.orig_df = df.copy()
-        prompt_template = build_prompt(lang_map[language_mode])
+        # 2. CONSOLIDATE DATA (Unique Mobile Logic)
+        status_text.info("Consolidating data by unique mobile number...")
+        df_consolidated = consolidate_data_by_mobile(raw_df)
         
-        total_rows = len(df)
+        # We work on the consolidated DF now
+        prompt_template = build_prompt(lang_map[language_mode])
+        total_rows = len(df_consolidated)
+        
+        status_text.info(f"Processing {total_rows} unique contacts with {max_workers} threads...")
         progress_bar.progress(0.0)
-        status_text.info(f"Starting processing for {total_rows} items with {max_workers} threads...")
 
-        # Reset results
-        st.session_state.processed_results = []
-        processed_results = [] # Local list for loop
+        processed_results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(process_single_row, idx, row, api_key, prompt_template, keep_remote): idx
-                for idx, row in df.iterrows()
+                for idx, row in df_consolidated.iterrows()
             }
 
             completed = 0
@@ -584,51 +517,51 @@ def main():
                 processed_results.append(res)
                 completed += 1
                 
-                # Update progress
                 progress_bar.progress(completed / total_rows)
-                status_text.markdown(f"Processed **{completed}/{total_rows}** files.")
+                status_text.markdown(f"Processed **{completed}/{total_rows}** unique contacts.")
                 
-                # Live Preview - OPTIMIZED
+                # Live Preview
                 recent_results = sorted(processed_results, key=lambda r: r["index"])[-5:]
                 preview_df = pd.DataFrame(recent_results)
                 if not preview_df.empty:
                     result_placeholder.dataframe(preview_df[["mobile_number", "status", "transcript"]], width=800)
 
-        # Final merge happens ONCE at the end
-        final_df = merge_results_with_original(df, processed_results)
+        final_df = merge_results_with_original(df_consolidated, processed_results)
         st.session_state.final_df = final_df
-        st.session_state.processed_results = processed_results
-        
         status_text.success("Batch Processing Complete!")
 
-    # --- RESULTS VIEWER (Part 4 Logic) ---
+    # --- VIEWER ---
     final_df = st.session_state.final_df
-
     if not final_df.empty:
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.markdown("## 🎛️ Transcript Browser")
 
         col_a, col_b, col_c, col_d = st.columns([3, 1, 1, 1])
         with col_a:
-            search_q = st.text_input("Search transcripts", value="", placeholder="Search text or phone...")
+            search_q = st.text_input("Search", placeholder="Search text or phone...")
         with col_b:
-            status_sel = st.selectbox("Status", options=["All", "✅ Success", "❌ Error", "❌ Failed"], index=0)
+            status_sel = st.selectbox("Status", ["All", "Success", "Failed", "Skipped"])
         with col_c:
-            speaker_sel = st.selectbox("Speaker", options=["All", "Speaker 1", "Speaker 2"], index=0)
+            speaker_sel = st.selectbox("Speaker", ["All", "Speaker 1", "Speaker 2"])
         with col_d:
-            per_page = st.selectbox("Per page", options=[5, 10, 20, 50], index=1)
+            per_page = st.selectbox("Per page", [5, 10, 20, 50], index=1)
 
-        # Filter
         view_df = final_df.copy()
-        if status_sel != "All":
-            view_df = view_df[view_df["status"] == status_sel]
         
+        # Filters
+        if status_sel != "All":
+            if status_sel == "Success":
+                view_df = view_df[view_df["status"].str.contains("Success", case=False, na=False)]
+            elif status_sel == "Failed":
+                view_df = view_df[view_df["status"].str.contains("Failed|Error", case=False, na=False)]
+            elif status_sel == "Skipped":
+                view_df = view_df[view_df["status"].str.contains("Skipped", case=False, na=False)]
+
         if search_q.strip():
             q = search_q.lower()
             mask = (
                 view_df["transcript"].fillna("").str.lower().str.contains(q) |
-                view_df["mobile_number"].astype(str).str.lower().str.contains(q) |
-                view_df["recording_url"].astype(str).str.lower().str.contains(q)
+                view_df["mobile_number"].astype(str).str.lower().str.contains(q)
             )
             view_df = view_df[mask]
 
@@ -650,34 +583,15 @@ def main():
         # Download
         out_buf = BytesIO()
         view_df.to_excel(out_buf, index=False)
-        st.download_button(
-            "📥 Download Filtered Results",
-            data=out_buf.getvalue(),
-            file_name=f"transcripts_export_{int(time.time())}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("📥 Download Filtered Results", out_buf.getvalue(), "transcripts.xlsx")
 
-        # Render Cards
+        # Cards
         for idx, row in page_df.iterrows():
             header = f"{row.get('mobile_number','Unknown')} — {row.get('status','')}"
             with st.expander(header, expanded=False):
-                # Meta
-                meta_html = "<div class='meta-row'>"
-                meta_html += f"URL: {html.escape(str(row.get('recording_url', '')))}"
-                
-                # Extra columns
-                extra_meta = []
-                for col in row.index:
-                    if col not in ("mobile_number", "recording_url", "status", "transcript", "error", "index"):
-                        val = row.get(col)
-                        extra_meta.append(f"{html.escape(str(col))}: {html.escape(str(val))}")
-                
-                if extra_meta:
-                    meta_html += " &nbsp; | &nbsp; " + " &nbsp; ".join(extra_meta)
-                meta_html += "</div>"
+                meta_html = f"<div class='meta-row'>URL: {html.escape(str(row.get('recording_url', 'None')))}</div>"
                 st.markdown(meta_html, unsafe_allow_html=True)
-
-                # Transcript
+                
                 transcript_html = colorize_transcript_html(row.get("transcript", ""))
                 st.markdown(f"<div class='transcript-box'>{transcript_html}</div>", unsafe_allow_html=True)
                 
