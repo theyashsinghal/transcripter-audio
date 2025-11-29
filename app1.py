@@ -1,11 +1,14 @@
 # app.py — COMPLETE BATCH TRANSCRIBER
-# Features: 
-# 1. Multi-file Excel Upload
-# 2. Robust Gemini API Integration (Upload/Poll/Transcribe)
-# 3. Unique Mobile Number Logic (Processes distinct contacts only)
-# 4. Latest Recording Priority (Picks the latest valid audio URL)
-# 5. Outcome History Fallback (If no audio, concatenates all call outcomes)
-# 6. Max Concurrency increased to 16
+# -----------------------------------------------------------------------------
+# FEATURES INCLUDED:
+# 1. Multi-file Excel Upload (Merges multiple files).
+# 2. Robust Gemini API Integration (Resumable Uploads, Polling, Retries).
+# 3. Unique Mobile Number Logic (Processes each contact only once).
+# 4. Latest Recording Priority (Always picks the most recent valid audio).
+# 5. Outcome History Fallback (If no audio exists, compiles all call outcomes).
+# 6. Empty Response Retry (Retries Gemini API if it returns empty text).
+# 7. High Concurrency (Slider up to 16 workers).
+# -----------------------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -287,6 +290,7 @@ def delete_file(api_key: str, file_name: str):
 def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str) -> str:
     """
     Calls Gemini v1beta generateContent to transcribe the audio.
+    INCLUDES RETRY LOGIC for empty responses.
     """
     api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
 
@@ -311,33 +315,43 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
         }
     }
 
-    resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
+    # RETRY LOOP FOR CONTENT
+    # Sometimes API returns 200 but empty content. We retry up to 3 times.
+    max_content_retries = 3
     
-    if resp.status_code != 200:
-        logger.error("Transcription API returned %s: %s", resp.status_code, resp.text)
-        return f"API ERROR {resp.status_code}: {resp.text}"
+    for attempt in range(max_content_retries):
+        resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
+        
+        if resp.status_code != 200:
+            logger.error("Transcription API returned %s: %s", resp.status_code, resp.text)
+            return f"API ERROR {resp.status_code}: {resp.text}"
 
-    try:
-        body = resp.json()
-    except ValueError:
-        return "PARSE ERROR: Non-JSON response from transcription API."
+        try:
+            body = resp.json()
+        except ValueError:
+            return "PARSE ERROR: Non-JSON response from transcription API."
 
-    candidates = body.get("candidates") or []
-    if not candidates:
+        # Check for block reasons first
         prompt_feedback = body.get("promptFeedback", {})
         if prompt_feedback and prompt_feedback.get("blockReason"):
             return f"BLOCKED: {prompt_feedback.get('blockReason')}"
-        return "NO TRANSCRIPT (Empty Response)"
-    
-    first = candidates[0]
-    content = first.get("content", {})
-    parts = content.get("parts", [])
-    if not parts:
-        return "NO TRANSCRIPT (No parts in response)"
-    
-    first_part = parts[0]
-    text = first_part.get("text") or first_part.get("content") or ""
-    return text
+
+        # Check for valid candidates
+        candidates = body.get("candidates") or []
+        if candidates:
+            first = candidates[0]
+            content = first.get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                text = parts[0].get("text") or parts[0].get("content") or ""
+                if text.strip():
+                    return text # Return valid text immediately
+        
+        # If we reached here, response was 200 OK but had no content.
+        logger.warning(f"GenerateContent attempt {attempt+1}/{max_content_retries} empty. Retrying...")
+        time.sleep(2 * (attempt + 1)) # Backoff
+
+    return "NO TRANSCRIPT (Empty Response after retries)"
 
 def build_prompt(language_label: str) -> str:
     """
@@ -510,8 +524,10 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
         result["transcript"] = transcript
         
         # Check for API-level errors in the text response
-        if transcript.startswith("API ERROR") or transcript.startswith("PARSE ERROR") or transcript.startswith("BLOCKED"):
+        if "API ERROR" in transcript or "PARSE ERROR" in transcript or "BLOCKED" in transcript:
             result["status"] = "❌ Error"
+        elif "NO TRANSCRIPT" in transcript:
+            result["status"] = "❌ Empty" # Distinct status for persistent empty responses
         else:
             result["status"] = "✅ Success"
 
@@ -604,7 +620,7 @@ def main():
         st.header("Configuration")
         api_key = st.text_input("Gemini API Key", type="password")
         
-        # UPDATED: Max workers raised to 16 as requested
+        # Max workers set to 16 as requested
         max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=16, value=4,
                                 help="Higher = faster but may hit API rate limits.")
         
@@ -670,7 +686,7 @@ def main():
         raw_df = pd.concat(all_dfs, ignore_index=True)
 
         # Check for required columns
-        required_cols = ["recording_url", "mobile_number", "outcome"] # Added outcome as required for fallback logic
+        required_cols = ["recording_url", "mobile_number", "outcome"] 
         missing_cols = [c for c in required_cols if c not in raw_df.columns]
         if missing_cols:
             st.error(f"Missing required columns in dataset: {', '.join(missing_cols)}")
@@ -753,7 +769,7 @@ def main():
             if status_sel == "Success":
                 view_df = view_df[view_df["status"].str.contains("Success", case=False, na=False)]
             elif status_sel == "Failed":
-                view_df = view_df[view_df["status"].str.contains("Failed|Error", case=False, na=False)]
+                view_df = view_df[view_df["status"].str.contains("Failed|Error|Empty", case=False, na=False)]
             elif status_sel == "Skipped":
                 view_df = view_df[view_df["status"].str.contains("Skipped", case=False, na=False)]
 
