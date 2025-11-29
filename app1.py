@@ -7,7 +7,7 @@
 # 4. Latest Recording Priority (Always picks the most recent valid audio).
 # 5. Outcome History Fallback (If no audio exists, compiles all call outcomes).
 # 6. Empty Response Retry (Retries Gemini API if it returns empty text).
-# 7. High Concurrency (Slider up to 16 workers).
+# 7. High Concurrency (Slider up to 32 workers).
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -621,7 +621,7 @@ def main():
         api_key = st.text_input("Gemini API Key", type="password")
         
         # Max workers set to 16 as requested
-        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=16, value=4,
+        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=32, value=4,
                                 help="Higher = faster but may hit API rate limits.")
         
         keep_remote = st.checkbox("Keep audio on Google", value=False,
