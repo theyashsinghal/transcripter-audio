@@ -5,6 +5,7 @@
 # 3. Unique Mobile Number Logic (Processes distinct contacts only)
 # 4. Latest Recording Priority (Picks the latest valid audio URL)
 # 5. Outcome History Fallback (If no audio, concatenates all call outcomes)
+# 6. Max Concurrency increased to 16
 
 import streamlit as st
 import pandas as pd
@@ -603,7 +604,8 @@ def main():
         st.header("Configuration")
         api_key = st.text_input("Gemini API Key", type="password")
         
-        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=8, value=4,
+        # UPDATED: Max workers raised to 16 as requested
+        max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=16, value=4,
                                 help="Higher = faster but may hit API rate limits.")
         
         keep_remote = st.checkbox("Keep audio on Google", value=False,
