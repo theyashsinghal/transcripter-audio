@@ -1,4 +1,4 @@
-# classify_calls_app.py — STEP 3: AUTOMATED DISPOSITIONING (Updated to 64 Threads)
+# classify_calls_app.py — STEP 3: AUTOMATED DISPOSITIONING (Default Concurrency: 16)
 
 import streamlit as st
 import pandas as pd
@@ -160,6 +160,11 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
             
         # Parse response
         body = resp.json()
+        
+        # Extract the raw text from the candidate
+        if not body.get('candidates'):
+             raise Exception("Gemini returned no candidates.")
+             
         text = body['candidates'][0]['content']['parts'][0]['text']
         
         # Robustly extract JSON from the raw text response (in case of markdown fences)
@@ -200,8 +205,8 @@ def main():
         classification_api_key = st.text_input("Gemini Classification API Key", type="password", key="classification_key")
         st.caption("Use a separate key for this high-volume classification step.")
         
-        # CONCURRENCY SLIDER UPDATED TO 64
-        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=64, value=64,
+        # CONCURRENCY SLIDER UPDATED: Max 64, Default 16
+        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=64, value=16,
                                     help="Threads used for parallel API calls. Be mindful of API rate limits.")
 
     # --- INPUT ---
