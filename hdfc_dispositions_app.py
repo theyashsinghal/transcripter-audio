@@ -1,4 +1,4 @@
-# classify_calls_app.py — STEP 3: AUTOMATED DISPOSITIONING
+# classify_calls_app.py — STEP 3: AUTOMATED DISPOSITIONING (Updated to 64 Threads)
 
 import streamlit as st
 import pandas as pd
@@ -15,7 +15,6 @@ from typing import Dict, Any, List
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 MODEL_NAME = "gemini-2.5-flash" 
-MAX_WORKERS = 4 # Max workers for concurrent classification
 
 # Configure logging
 logging.basicConfig(
@@ -51,23 +50,31 @@ DISPOSITION_STRUCTURE = {
     "Not Retained": ["Satisfied with his policy but wish to Surrender", "Dis-satisfied with policy returns.", "Need of Money - Wants to invest in other financial instruments", "Need of Money - For personal expenses or to buy asset", "Short term sale-3/5 years", "Mis sale- Complaint", "Policy servicing complaint to be resolved (delay/not processed/ error)", "Unhappy with FC service", "Unhappy with Branch Service", "Reinvestment with others", "Branch advising to buy new policy by surrendering existing policy", "Unhappy with Policy T&C", "Market Volatility"]
 }
 
-# --- NETWORK UTILITIES (Copied for stability) ---
+# --- NETWORK UTILITIES (WITH RETRY LOGIC) ---
 
 def _sleep_with_jitter(base_seconds: float, attempt: int):
+    """Adds exponential backoff and jitter to sleep time."""
     jitter = random.uniform(0.5, 1.5)
-    to_sleep = min(base_seconds * (2 ** attempt) * jitter, 10) # Reduced max sleep for classification
+    to_sleep = min(base_seconds * (2 ** attempt) * jitter, 15) 
     time.sleep(to_sleep)
 
 def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
+    """
+    Robust wrapper for requests with exponential backoff + jitter.
+    Handles 429 (Rate Limit) and 5xx (Server Errors).
+    """
     last_exc = None
     for attempt in range(max_retries):
         try:
-            resp = requests.request(method, url, timeout=45, **kwargs) # Shorter timeout for classification
+            resp = requests.request(method, url, timeout=45, **kwargs) 
+            # Check for transient errors
             if resp.status_code == 429 or (500 <= resp.status_code < 600):
+                logger.warning(f"Transient HTTP {resp.status_code}. Retrying classification...")
                 _sleep_with_jitter(backoff_base, attempt)
                 continue
             return resp
         except requests.exceptions.RequestException as e:
+            logger.warning(f"RequestException: {str(e)} (attempt {attempt + 1})")
             last_exc = e
             _sleep_with_jitter(backoff_base, attempt)
     if last_exc: raise last_exc
@@ -131,10 +138,11 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         "classification_error": None
     }
     
-    # Skip processing non-conversation rows efficiently (Failed/Skipped/Empty transcripts)
-    if not transcript or "SYSTEM ERROR" in transcript or "SKIP" in row.get("status", "") or "NO TRANSCRIPT" in transcript:
+    # Skip processing rows that failed transcription or were non-connects based on the previous app's logic
+    if not transcript or "SYSTEM ERROR" in transcript or "SKIP" in row.get("status", "") or "NO TRANSCRIPT" in transcript or "Outcomes:" in transcript:
+        # Default non-connect classification for non-conversational rows
         result.update({
-            "status": "🚫 Skipped (No Conversation)",
+            "status": "🚫 Skipped (Non-Conversational)",
             "main_disposition": "Non Connect",
             "sub_disposition": "Others Non Connect"
         })
@@ -144,7 +152,7 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         prompt = build_classification_prompt(mobile, transcript, dispositions)
         api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
         
-        # Call the API
+        # Call the API using the robust retry function
         resp = make_request_with_retry("POST", api_url, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
         
         if resp.status_code != 200:
@@ -154,8 +162,7 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         body = resp.json()
         text = body['candidates'][0]['content']['parts'][0]['text']
         
-        # Extract JSON from the raw text response
-        # Sometimes Gemini wraps JSON in markdown fences (```json...```)
+        # Robustly extract JSON from the raw text response (in case of markdown fences)
         json_start = text.find('{')
         json_end = text.rfind('}') + 1
         json_str = text[json_start:json_end]
@@ -188,12 +195,14 @@ def main():
     # --- SIDEBAR CONFIG ---
     with st.sidebar:
         st.header("Configuration")
+        
         # NEW API KEY INPUT FIELD
         classification_api_key = st.text_input("Gemini Classification API Key", type="password", key="classification_key")
         st.caption("Use a separate key for this high-volume classification step.")
         
-        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=8, value=4,
-                                    help="Threads used for parallel API calls.")
+        # CONCURRENCY SLIDER UPDATED TO 64
+        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=64, value=64,
+                                    help="Threads used for parallel API calls. Be mindful of API rate limits.")
 
     # --- INPUT ---
     st.header("1. Input Data")
@@ -222,7 +231,7 @@ def main():
             st.error(f"Input file must contain columns: {', '.join(required_cols)}.")
             st.stop()
         
-        # Prepare data for processing (only use the necessary columns)
+        # Prepare data for processing
         df = df.reset_index()
 
         st.info(f"Starting classification for {len(df)} records with {max_workers_cls} threads...")
