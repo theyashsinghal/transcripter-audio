@@ -6,6 +6,7 @@
 # 3. PROCESSES EVERY ROW (No unique mobile number filtering).
 # 4. Empty Response Retry (Retries Gemini API if it returns empty text).
 # 5. High Concurrency (Slider up to 128 workers).
+# 6. NEW: Job-Level Retry (Retries the full sequence on transient failure).
 # -----------------------------------------------------------------------------
 
 import streamlit as st
@@ -28,11 +29,14 @@ from typing import Optional, Dict, Any
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
 UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
-# NOTE: Using "gemini-2.5-flash" for speed and stability.
 MODEL_NAME = "gemini-2.5-flash" 
 
 # Streaming download chunk size (8KB)
 DOWNLOAD_CHUNK_SIZE = 8192
+
+# Job-level retry configuration
+MAX_WORKER_RETRIES = 3 # Number of attempts per row (initial + 2 retries)
+WORKER_BACKOFF_BASE = 5 # Base seconds for backoff (5s, 10s, 20s)
 
 # Configure logging to console
 logging.basicConfig(
@@ -436,20 +440,21 @@ def prepare_all_rows(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(final_rows).reset_index(drop=True)
 
 
-# --- WORKER / PROCESSING FUNCTION ---
+# --- WORKER / PROCESSING FUNCTION (NOW WITH JOB-LEVEL RETRY) ---
 
 def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template: str, keep_remote: bool = False) -> Dict[str, Any]:
     """
     The worker function executed by ThreadPoolExecutor.
-    Handles logic based on 'processing_action' flag.
+    Handles logic based on 'processing_action' flag and includes a job-level retry loop.
     """
     mobile = str(row.get("mobile_number", "Unknown"))
     
+    # Initialize result structure
     result = {
         "index": index,
         "mobile_number": mobile,
         "recording_url": row.get("recording_url"),
-        "transcript": row.get("transcript", ""), # Might be pre-filled with skip message
+        "transcript": row.get("transcript", ""), 
         "status": row.get("status", "Pending"),
         "error": row.get("error", None),
     }
@@ -457,82 +462,103 @@ def process_single_row(index: int, row: pd.Series, api_key: str, prompt_template
     # Check the flag set by the preparation logic
     action = row.get("processing_action", "TRANSCRIBE")
     
-    # If set to SKIP, we return the pre-calculated result immediately
     if action == "SKIP":
         return result
 
-    # Validate URL (Double check)
+    # Validate URL (Double check before entering retry loop)
     audio_url = row.get("recording_url")
     if not audio_url or not isinstance(audio_url, str):
         result.update({"status": "❌ Failed", "error": "Invalid URL"})
         return result
 
-    tmp_path = None
-    file_info = None
-
-    try:
-        parsed = urlparse(audio_url)
-
-        # 1. Download file (streamed)
-        r = make_request_with_retry("GET", audio_url, stream=True)
-        if r.status_code != 200:
-            raise Exception(f"Failed to download audio URL ({r.status_code})")
-
-        header_ct = r.headers.get("content-type", "")
-        ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
-
-        # Save to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                if chunk:
-                    tmp.write(chunk)
-            tmp_path = tmp.name
-
-        file_size = os.path.getsize(tmp_path)
-
-        # 2. Upload to Google (Resumable)
-        cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
-        unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
-
-        upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
-        file_info = upload_bytes(upload_url, tmp_path, mime_type)
-
-        # 3. Wait for Processing
-        wait_for_active(api_key, file_info["name"])
-
-        # 4. Transcribe
-        transcript = generate_transcript(api_key, file_info["uri"], mime_type, prompt_template)
-        result["transcript"] = transcript
+    # --- JOB-LEVEL RETRY LOOP ---
+    for worker_attempt in range(MAX_WORKER_RETRIES):
         
-        # Check for API-level errors in the text response
-        if "API ERROR" in transcript or "PARSE ERROR" in transcript or "BLOCKED" in transcript:
-            result["status"] = "❌ Error"
-        elif "NO TRANSCRIPT" in transcript:
-            result["status"] = "❌ Empty" # Distinct status for persistent empty responses
-        else:
-            result["status"] = "✅ Success"
+        tmp_path = None
+        file_info = None
 
-    except Exception as e:
-        logger.exception("Processing failed for row %s: %s", index, str(e))
-        result["transcript"] = f"SYSTEM ERROR: {str(e)}"
-        result["status"] = "❌ Failed"
-        result["error"] = str(e)
+        try:
+            parsed = urlparse(audio_url)
 
-    finally:
-        # Cleanup local temp file
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception as e:
-                logger.warning("Failed to remove tmp file %s: %s", tmp_path, str(e))
-        
-        # Cleanup remote file on Google (unless debugging)
-        if file_info and isinstance(file_info, dict) and file_info.get("name") and not keep_remote:
-            try:
-                delete_file(api_key, file_info["name"])
-            except Exception:
-                pass
+            # 1. Download file (streamed)
+            logger.info("Attempt %d: Downloading %s...", worker_attempt + 1, mobile)
+            r = make_request_with_retry("GET", audio_url, stream=True)
+            if r.status_code != 200:
+                raise Exception(f"Failed to download audio URL ({r.status_code})")
 
+            header_ct = r.headers.get("content-type", "")
+            ext, mime_type = detect_extension_and_mime(parsed.path, header_ct)
+
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if chunk:
+                        tmp.write(chunk)
+                tmp_path = tmp.name
+
+            file_size = os.path.getsize(tmp_path)
+
+            # 2. Upload to Google (Resumable)
+            logger.info("Attempt %d: Uploading %s (size: %d)...", worker_attempt + 1, mobile, file_size)
+            cleaned_mobile = "".join(ch for ch in mobile if ch.isalnum())
+            unique_name = f"rec_{cleaned_mobile}_{int(time.time())}_{random.randint(100,999)}{ext}"
+
+            upload_url = initiate_upload(api_key, unique_name, mime_type, file_size)
+            file_info = upload_bytes(upload_url, tmp_path, mime_type)
+
+            # 3. Wait for Processing
+            logger.info("Attempt %d: Waiting for active status for %s...", worker_attempt + 1, mobile)
+            wait_for_active(api_key, file_info["name"])
+
+            # 4. Transcribe (includes internal empty response retries)
+            logger.info("Attempt %d: Transcribing %s...", worker_attempt + 1, mobile)
+            transcript = generate_transcript(api_key, file_info["uri"], mime_type, prompt_template)
+            result["transcript"] = transcript
+            
+            # Check for API-level errors in the text response
+            if "API ERROR" in transcript or "PARSE ERROR" in transcript or "BLOCKED" in transcript:
+                result["status"] = "❌ Error"
+                # Raise an exception here to trigger retry, unless this is the final attempt
+                if worker_attempt < MAX_WORKER_RETRIES - 1:
+                    raise Exception(f"Transcription error: {transcript}")
+            elif "NO TRANSCRIPT" in transcript:
+                result["status"] = "❌ Empty"
+                # Raise an exception here to trigger retry
+                if worker_attempt < MAX_WORKER_RETRIES - 1:
+                    raise Exception(f"Empty transcript response after retries.")
+            else:
+                result["status"] = "✅ Success"
+                # Success! Break the worker retry loop and return the result
+                return result
+
+        except Exception as e:
+            # If the exception occurred during the final attempt, log and save the error.
+            if worker_attempt == MAX_WORKER_RETRIES - 1:
+                logger.exception("Final processing attempt failed for %s: %s", mobile, str(e))
+                result["transcript"] = f"SYSTEM ERROR: {str(e)}"
+                result["status"] = "❌ Failed"
+                result["error"] = str(e)
+            else:
+                # Transient error, log and prepare for retry
+                logger.warning("Transient worker failure for %s (attempt %d). Retrying after backoff: %s", mobile, worker_attempt + 1, str(e))
+                _sleep_with_jitter(WORKER_BACKOFF_BASE, worker_attempt)
+
+        finally:
+            # Ensure local temp file is deleted after each attempt
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception as e:
+                    logger.warning("Failed to remove tmp file %s: %s", tmp_path, str(e))
+            
+            # Ensure remote file is deleted after each attempt (unless keeping for debug)
+            if file_info and isinstance(file_info, dict) and file_info.get("name") and not keep_remote:
+                try:
+                    delete_file(api_key, file_info["name"])
+                except Exception:
+                    pass
+
+    # If the loop finishes without returning (i.e., all attempts failed)
     return result
 
 
@@ -601,7 +627,7 @@ def main():
         st.header("Configuration")
         api_key = st.text_input("Gemini API Key", type="password")
         
-        # Adjusted max_value to 128 as requested
+        # Concurrency slider
         max_workers = st.slider("Concurrency (Threads)", min_value=1, max_value=128, value=4,
                                 help="Higher = faster but may hit API rate limits.")
         
