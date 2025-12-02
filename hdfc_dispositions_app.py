@@ -1,5 +1,3 @@
-# classify_calls_app.py — STEP 3: AUTOMATED DISPOSITIONING (Default Concurrency: 16)
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -55,30 +53,44 @@ DISPOSITION_STRUCTURE = {
 def _sleep_with_jitter(base_seconds: float, attempt: int):
     """Adds exponential backoff and jitter to sleep time."""
     jitter = random.uniform(0.5, 1.5)
+    # The exponential backoff time doubles with each attempt, but is capped at 15 seconds.
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 15) 
     time.sleep(to_sleep)
 
-def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
+def make_request_with_retry(method: str, url: str, backoff_base: float = 0.5, **kwargs) -> requests.Response:
     """
-    Robust wrapper for requests with exponential backoff + jitter.
-    Handles 429 (Rate Limit) and 5xx (Server Errors).
+    Robust wrapper for requests with TRUE INFINITE RETRY for transient errors.
+    Handles 429 (Rate Limit), 5xx (Server Errors), and general RequestExceptions.
+    Raises an exception immediately for non-transient errors (e.g., 400, 401, 403).
     """
-    last_exc = None
-    for attempt in range(max_retries):
+    attempt = 0
+    # Loop infinitely until a successful 200 response is received or a fatal error occurs.
+    while True: 
         try:
-            resp = requests.request(method, url, timeout=45, **kwargs) 
-            # Check for transient errors
+            resp = requests.request(method, url, timeout=45, **kwargs)
+
+            # Check for transient errors (Retry)
             if resp.status_code == 429 or (500 <= resp.status_code < 600):
-                logger.warning(f"Transient HTTP {resp.status_code}. Retrying classification...")
+                logger.warning(f"Transient HTTP {resp.status_code}. Retrying classification... (Attempt {attempt + 1})")
                 _sleep_with_jitter(backoff_base, attempt)
-                continue
-            return resp
+                attempt += 1 
+                continue # Go back to the start of the while True loop
+
+            # Check for success (Exit)
+            if resp.status_code == 200:
+                return resp
+            
+            # Check for non-transient (Fatal) errors (Exit with Failure)
+            # e.g., 400 Bad Request, 401 Unauthorized, 403 Forbidden (likely bad API key)
+            raise Exception(f"Fatal API Error {resp.status_code}: {resp.text}")
+
         except requests.exceptions.RequestException as e:
-            logger.warning(f"RequestException: {str(e)} (attempt {attempt + 1})")
-            last_exc = e
+            # Handle network errors (Retry)
+            logger.warning(f"RequestException: {str(e)} (attempt {attempt + 1}). Retrying...")
             _sleep_with_jitter(backoff_base, attempt)
-    if last_exc: raise last_exc
-    raise Exception("make_request_with_retry: retries exhausted")
+            attempt += 1
+            continue # Go back to the start of the while True loop
+
 
 # --- PROMPT CONSTRUCTION ---
 
@@ -135,6 +147,7 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         "status": "Pending",
         "main_disposition": "N/A",
         "sub_disposition": "N/A",
+        "classification_summary": "N/A", # Ensure summary is initialized
         "classification_error": None
     }
     
@@ -144,7 +157,8 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         result.update({
             "status": "🚫 Skipped (Non-Conversational)",
             "main_disposition": "Non Connect",
-            "sub_disposition": "Others Non Connect"
+            "sub_disposition": "Others Non Connect",
+            "classification_summary": "Transcript was empty or contained system errors only."
         })
         return result
 
@@ -152,12 +166,11 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         prompt = build_classification_prompt(mobile, transcript, dispositions)
         api_url = f"{BASE_URL}/v1beta/models/{MODEL_NAME}:generateContent?key={api_key}"
         
-        # Call the API using the robust retry function
+        # Call the API using the robust retry function (now with true infinite retry for transient errors)
         resp = make_request_with_retry("POST", api_url, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
         
-        if resp.status_code != 200:
-            raise Exception(f"API Error {resp.status_code}: {resp.text}")
-            
+        # NOTE: If we reach this point, the response status code is guaranteed to be 200 (SUCCESS)
+        
         # Parse response
         body = resp.json()
         
@@ -183,6 +196,7 @@ def generate_disposition_for_call(index: int, row: pd.Series, api_key: str, disp
         
     except Exception as e:
         logger.error(f"Classification failed for {mobile}: {e}")
+        # This block is now primarily hit for fatal non-transient errors (e.g., 401/403) or JSON parsing errors.
         result.update({
             "status": "❌ Classification Failed",
             "classification_error": str(e)
@@ -205,9 +219,12 @@ def main():
         classification_api_key = st.text_input("Gemini Classification API Key", type="password", key="classification_key")
         st.caption("Use a separate key for this high-volume classification step.")
         
-        # CONCURRENCY SLIDER UPDATED: Max 64, Default 16
-        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=64, value=16,
-                                    help="Threads used for parallel API calls. Be mindful of API rate limits.")
+        # CONCURRENCY SLIDER UPDATED: Max 256, Default 16
+        max_workers_cls = st.slider("Classification Concurrency", min_value=1, max_value=256, value=8, # Max value is now 256
+                                     help="Threads used for parallel API calls. Given the infinite retry logic, a lower concurrency (e.g., 5-8) is highly recommended.")
+        
+        st.error("⚠️ **Infinite Retry Enabled**\n\nThis application will now retry transient API errors (rate limits, server errors) indefinitely. If you have an invalid API key, the processing may hang on the first few records. Please monitor your logs.")
+
 
     # --- INPUT ---
     st.header("1. Input Data")
@@ -256,10 +273,18 @@ def main():
             
             completed = 0
             for future in as_completed(futures):
-                res = future.result()
-                processed_results.append(res)
-                completed += 1
-                
+                # The result() call will block until the thread successfully returns (which can now take longer 
+                # due to infinite retries on transient errors).
+                try:
+                    res = future.result()
+                    processed_results.append(res)
+                    completed += 1
+                except Exception as e:
+                    # Catch errors that should have caused the thread to fail immediately (e.g., bad API key)
+                    logger.critical(f"A worker thread terminated unexpectedly: {e}")
+                    # We still increment completed counter to update the UI correctly
+                    completed += 1 
+
                 progress_bar.progress(completed / total_rows)
                 status_text.text(f"Classified {completed}/{total_rows} calls.")
         
