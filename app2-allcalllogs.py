@@ -35,8 +35,8 @@ MODEL_NAME = "gemini-2.5-flash"
 DOWNLOAD_CHUNK_SIZE = 8192
 
 # Job-level retry configuration
-MAX_WORKER_RETRIES = 3 # Number of attempts per row (initial + 2 retries)
-WORKER_BACKOFF_BASE = 5 # Base seconds for backoff (5s, 10s, 20s)
+MAX_WORKER_RETRIES = 100 # Number of attempts per row (initial + 2 retries)
+WORKER_BACKOFF_BASE = 2 # Base seconds for backoff (5s, 10s, 20s)
 
 # Configure logging to console
 logging.basicConfig(
@@ -115,7 +115,7 @@ def _sleep_with_jitter(base_seconds: float, attempt: int):
     to_sleep = min(base_seconds * (2 ** attempt) * jitter, 30)
     time.sleep(to_sleep)
 
-def make_request_with_retry(method: str, url: str, max_retries: int = 5, backoff_base: float = 0.5, **kwargs) -> requests.Response:
+def make_request_with_retry(method: str, url: str, max_retries: int = 100, backoff_base: float = 0.5, **kwargs) -> requests.Response:
     """
     Robust wrapper for requests with exponential backoff + jitter.
     Handles 429 (Rate Limit) and 5xx (Server Errors).
@@ -319,7 +319,7 @@ def generate_transcript(api_key: str, file_uri: str, mime_type: str, prompt: str
 
     # RETRY LOOP FOR CONTENT
     # Sometimes API returns 200 but empty content. We retry up to 3 times.
-    max_content_retries = 3
+    max_content_retries = 100
     
     for attempt in range(max_content_retries):
         resp = make_request_with_retry("POST", api_url, json=payload, headers={"Content-Type": "application/json"})
