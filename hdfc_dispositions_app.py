@@ -12,7 +12,7 @@ from typing import Dict, Any, List
 
 # --- CONFIGURATION ---
 BASE_URL = "https://generativelanguage.googleapis.com"
-MODEL_NAME = "gemini-3-pro" 
+MODEL_NAME = "gemini-3-pro-preview" 
 
 # Configure logging
 logging.basicConfig(
