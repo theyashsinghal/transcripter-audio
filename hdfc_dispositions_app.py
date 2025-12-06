@@ -108,7 +108,9 @@ def build_classification_prompt(mobile_number: str, transcript: str, disposition
 
     return f"""
 You are a highly analytical Call Analyst specialized in contact center call classification. 
-Your task is to review the provided call transcript and accurately assign the single MOST appropriate Main Disposition and Sub Disposition. Understand that if no voice is there during call then possibly a human didn't respond and mark it accordingly. Also double check all the dispositions and mark it carefully.
+Your task is to review the provided call transcript and accurately assign the single MOST appropriate Main Disposition and Sub Disposition. Also double check all the dispositions and mark it carefully.
+
+An explicit case handling - Carefully understand that if customer does not respond during call then possibly the call was connected but hung-up so mark it accordingly.
 
 CRITICAL INSTRUCTIONS:
 1. You MUST choose the Main Disposition and Sub Disposition ONLY from the provided DISPOSITION LIST.
